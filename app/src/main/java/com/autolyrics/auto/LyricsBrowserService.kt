@@ -90,6 +90,10 @@ class LyricsBrowserService : MediaBrowserServiceCompat() {
         private const val SYNC_MENU_ID = "sync_menu"
         private const val SYNC_MINUS_ID = "sync_minus"
         private const val SYNC_PLUS_ID = "sync_plus"
+        private const val TRACK_MINUS_ID = "track_offset_minus"
+        private const val TRACK_PLUS_ID = "track_offset_plus"
+        private const val TRACK_RESET_ID = "track_offset_reset"
+        private const val TRACK_STEP_MS = 1000L
         private const val SETTINGS_MENU_ID = "settings_menu"
         private const val PROFILE_PREFIX = "profile_"
         private const val SYNC_STEP_MS = 50L
@@ -213,6 +217,7 @@ class LyricsBrowserService : MediaBrowserServiceCompat() {
             LyricsStatus.FOUND -> {
                 addTrackHeader(state, items)
                 buildWindowedLyrics(state, items)
+                addTrackOffsetItems(state, items)
                 items.add(buildBrowsableItem(SYNC_MENU_ID, "⟳ Sync", "Adjust offset"))
             }
             LyricsStatus.PLAIN_ONLY -> {
@@ -249,6 +254,23 @@ class LyricsBrowserService : MediaBrowserServiceCompat() {
         items.add(buildBrowsableItem(SETTINGS_MENU_ID, "⚙ Settings", "Layout: ${aaProfile.label}"))
 
         result.sendResult(items)
+    }
+
+    private fun formatTrackOffset(offsetMs: Long): String {
+        val sign = if (offsetMs > 0) "+" else ""
+        return "Saved for this song: $sign%.1f s".format(offsetMs / 1000f)
+    }
+
+    private fun addTrackOffsetItems(
+        state: LyricsState,
+        items: MutableList<MediaBrowserCompat.MediaItem>
+    ) {
+        val subtitle = formatTrackOffset(state.trackOffsetMs)
+        items.add(buildTextItem(TRACK_MINUS_ID, "⏪  Lyrics −1 s", subtitle = subtitle))
+        items.add(buildTextItem(TRACK_PLUS_ID, "⏩  Lyrics +1 s", subtitle = subtitle))
+        if (state.trackOffsetMs != 0L) {
+            items.add(buildTextItem(TRACK_RESET_ID, "↺  Reset this song"))
+        }
     }
 
     private fun buildSettingsMenu(items: MutableList<MediaBrowserCompat.MediaItem>) {
@@ -783,6 +805,18 @@ class LyricsBrowserService : MediaBrowserServiceCompat() {
                     .edit().putLong("aa_offset_ms", aaOffsetMs).apply()
                 notifyChildrenChanged(ROOT_ID)
                 notifyChildrenChanged(SYNC_MENU_ID)
+                return
+            }
+
+            if (mediaId == TRACK_MINUS_ID || mediaId == TRACK_PLUS_ID || mediaId == TRACK_RESET_ID) {
+                when (mediaId) {
+                    TRACK_MINUS_ID -> mediaTracker.adjustTrackOffset(-TRACK_STEP_MS)
+                    TRACK_PLUS_ID -> mediaTracker.adjustTrackOffset(TRACK_STEP_MS)
+                    else -> mediaTracker.resetTrackOffset()
+                }
+                forceRefresh()
+                lastSubtitleText = null
+                updateMediaSession(mediaTracker.state.value)
                 return
             }
 

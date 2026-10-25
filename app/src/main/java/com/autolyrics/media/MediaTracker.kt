@@ -15,6 +15,7 @@ import com.autolyrics.lyrics.LyricsCache
 import com.autolyrics.lyrics.LyricsTranslator
 import com.autolyrics.lyrics.MetadataCleaner
 import com.autolyrics.lyrics.SyncLrcClient
+import com.autolyrics.lyrics.TrackOffsetStore
 import com.autolyrics.model.LyricLine
 import com.autolyrics.model.LyricsState
 import com.autolyrics.model.LyricsStatus
@@ -32,6 +33,7 @@ class MediaTracker private constructor(context: Context) {
     private val prefs: SharedPreferences =
         context.getSharedPreferences("auto_lyrics_prefs", Context.MODE_PRIVATE)
     private val lyricsCache = LyricsCache(context)
+    private val trackOffsets = TrackOffsetStore(context)
 
     private val _state = MutableStateFlow(LyricsState())
     val state: StateFlow<LyricsState> = _state.asStateFlow()
@@ -47,6 +49,7 @@ class MediaTracker private constructor(context: Context) {
     private var pendingTrack: TrackInfo? = null
     private var pendingArt: Bitmap? = null
     private var lyricsOffsetMs: Long = 0L
+    private var trackOffsetMs: Long = 0L
 
     init {
         lyricsOffsetMs = prefs.getLong("lyrics_offset_ms", 0L)
@@ -69,8 +72,10 @@ class MediaTracker private constructor(context: Context) {
         if (track.title == current?.title && track.artist == current.artist) return@Runnable
 
         translationJob?.cancel()
+        trackOffsetMs = trackOffsets.get(track)
         _state.value = _state.value.copy(
             track = track,
+            trackOffsetMs = trackOffsetMs,
             lines = emptyList(),
             currentIndex = -1,
             currentWordIndex = -1,
@@ -113,6 +118,26 @@ class MediaTracker private constructor(context: Context) {
         updateCurrentPosition()
     }
 
+    /** Adjusts the correction saved for the current track; only synced (dynamic) lyrics support it. */
+    fun adjustTrackOffset(deltaMs: Long) {
+        val current = _state.value
+        if (current.track == null || current.status != LyricsStatus.FOUND) return
+        setTrackOffset(current.track, trackOffsetMs + deltaMs)
+    }
+
+    fun resetTrackOffset() {
+        val current = _state.value
+        if (current.track == null || current.status != LyricsStatus.FOUND) return
+        setTrackOffset(current.track, 0L)
+    }
+
+    private fun setTrackOffset(track: TrackInfo, ms: Long) {
+        trackOffsetMs = ms
+        trackOffsets.set(track, ms)
+        _state.value = _state.value.copy(trackOffsetMs = ms)
+        updateCurrentPosition()
+    }
+
     fun resumePlayback() {
         activeController?.transportControls?.play()
     }
@@ -131,7 +156,8 @@ class MediaTracker private constructor(context: Context) {
             val elapsed = SystemClock.elapsedRealtime() - lastPositionUpdateTime
             lastPositionMs + (elapsed * playbackSpeed).toLong()
         }
-        return basePos + lyricsOffsetMs
+        val trackOffset = if (_state.value.status == LyricsStatus.FOUND) trackOffsetMs else 0L
+        return basePos + lyricsOffsetMs + trackOffset
     }
 
     private fun updateCurrentPosition() {
