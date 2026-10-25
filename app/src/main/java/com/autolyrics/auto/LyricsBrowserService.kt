@@ -20,6 +20,26 @@ import com.autolyrics.model.LyricsStatus
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.collectLatest
 
+/**
+ * How much lyric content is pushed to Android Auto. The car decides the real panel size and the
+ * app cannot detect it, so the user picks the profile that fits their Android Auto layout.
+ */
+private enum class LayoutProfile(
+    val id: String,
+    val label: String,
+    val description: String,
+    val windowSize: Int,
+    val plainWindowSize: Int
+) {
+    COMPACT("compact", "Compact", "Current line only, no track header", 1, 2),
+    NORMAL("normal", "Normal", "Current line plus 1 on each side", 3, 4),
+    WIDE("wide", "Wide", "Current line plus 3 on each side, next line in the player", 7, 8);
+
+    companion object {
+        fun fromId(id: String?): LayoutProfile = values().firstOrNull { it.id == id } ?: NORMAL
+    }
+}
+
 class LyricsBrowserService : MediaBrowserServiceCompat() {
 
     private lateinit var mediaSession: MediaSessionCompat
@@ -39,6 +59,7 @@ class LyricsBrowserService : MediaBrowserServiceCompat() {
 
     private var aaKaraokeEnabled = true
     private var aaOffsetMs = 0L
+    private var aaProfile = LayoutProfile.NORMAL
 
     private var lastKaraokeLineIdx = -1
     private var lastKaraokeWordIdx = -1
@@ -55,6 +76,12 @@ class LyricsBrowserService : MediaBrowserServiceCompat() {
                     aaOffsetMs = sp.getLong(key, 0L)
                     forceRefresh()
                 }
+                "aa_layout_profile" -> {
+                    aaProfile = LayoutProfile.fromId(sp.getString(key, null))
+                    forceRefresh()
+                    lastSubtitleText = null
+                    updateMediaSession(mediaTracker.state.value)
+                }
             }
         }
 
@@ -63,9 +90,9 @@ class LyricsBrowserService : MediaBrowserServiceCompat() {
         private const val SYNC_MENU_ID = "sync_menu"
         private const val SYNC_MINUS_ID = "sync_minus"
         private const val SYNC_PLUS_ID = "sync_plus"
+        private const val SETTINGS_MENU_ID = "settings_menu"
+        private const val PROFILE_PREFIX = "profile_"
         private const val SYNC_STEP_MS = 50L
-        private const val WINDOW_SIZE = 3
-        private const val PLAIN_WINDOW_SIZE = 4
         private const val PAD_WIDTH = 60
         private const val NOTIFY_THROTTLE_MS = 500L
         private const val BROWSE_KARAOKE_WINDOW_MS = 600L
@@ -81,6 +108,7 @@ class LyricsBrowserService : MediaBrowserServiceCompat() {
         val prefs = getSharedPreferences("auto_lyrics_prefs", MODE_PRIVATE)
         aaKaraokeEnabled = prefs.getBoolean("aa_karaoke_enabled", true)
         aaOffsetMs = prefs.getLong("aa_offset_ms", 0L)
+        aaProfile = LayoutProfile.fromId(prefs.getString("aa_layout_profile", null))
         prefs.registerOnSharedPreferenceChangeListener(prefsListener)
 
         mediaSession = MediaSessionCompat(this, "AutoLyrics").apply {
@@ -155,6 +183,12 @@ class LyricsBrowserService : MediaBrowserServiceCompat() {
             return
         }
 
+        if (parentId == SETTINGS_MENU_ID) {
+            buildSettingsMenu(items)
+            result.sendResult(items)
+            return
+        }
+
         if (parentId == SYNC_MINUS_ID || parentId == SYNC_PLUS_ID) {
             result.sendResult(items)
             return
@@ -196,10 +230,11 @@ class LyricsBrowserService : MediaBrowserServiceCompat() {
                             .coerceIn(0, state.lines.size - 1)
                     } else { 0 }
 
-                    val half = PLAIN_WINDOW_SIZE / 2
+                    val plainWindow = aaProfile.plainWindowSize
+                    val half = plainWindow / 2
                     val winStart = maxOf(0, estimatedIdx - half)
-                    val winEnd = minOf(state.lines.size, winStart + PLAIN_WINDOW_SIZE)
-                    val adjStart = maxOf(0, winEnd - PLAIN_WINDOW_SIZE)
+                    val winEnd = minOf(state.lines.size, winStart + plainWindow)
+                    val adjStart = maxOf(0, winEnd - plainWindow)
 
                     for (i in adjStart until winEnd) {
                         val text = state.lines[i].text.ifBlank { "♪" }
@@ -211,7 +246,25 @@ class LyricsBrowserService : MediaBrowserServiceCompat() {
             }
         }
 
+        items.add(buildBrowsableItem(SETTINGS_MENU_ID, "⚙ Settings", "Layout: ${aaProfile.label}"))
+
         result.sendResult(items)
+    }
+
+    private fun buildSettingsMenu(items: MutableList<MediaBrowserCompat.MediaItem>) {
+        for (profile in LayoutProfile.values()) {
+            val marker = if (profile == aaProfile) "●" else "○"
+            items.add(
+                MediaBrowserCompat.MediaItem(
+                    MediaDescriptionCompat.Builder()
+                        .setMediaId(PROFILE_PREFIX + profile.id)
+                        .setTitle("$marker  ${profile.label}")
+                        .setSubtitle(profile.description)
+                        .build(),
+                    MediaBrowserCompat.MediaItem.FLAG_PLAYABLE
+                )
+            )
+        }
     }
 
     private fun buildSyncMenu(
@@ -254,6 +307,9 @@ class LyricsBrowserService : MediaBrowserServiceCompat() {
         items: MutableList<MediaBrowserCompat.MediaItem>
     ) {
         val track = state.track ?: return
+        if (aaProfile == LayoutProfile.COMPACT &&
+            (state.status == LyricsStatus.FOUND || state.status == LyricsStatus.PLAIN_ONLY)
+        ) return
 
         val subtitle = buildString {
             append(track.artist)
@@ -310,11 +366,12 @@ class LyricsBrowserService : MediaBrowserServiceCompat() {
 
         val posMs = getAaPositionMs()
         val aaCurrentIdx = findLineIndex(lines, posMs).coerceAtLeast(0)
-        val half = WINDOW_SIZE / 2
+        val windowSize = aaProfile.windowSize
+        val half = windowSize / 2
 
         val windowStart = maxOf(0, aaCurrentIdx - half)
-        val windowEnd = minOf(lines.size, windowStart + WINDOW_SIZE)
-        val adjustedStart = maxOf(0, windowEnd - WINDOW_SIZE)
+        val windowEnd = minOf(lines.size, windowStart + windowSize)
+        val adjustedStart = maxOf(0, windowEnd - windowSize)
 
         for (i in adjustedStart until windowEnd) {
             val line = lines[i]
@@ -432,6 +489,15 @@ class LyricsBrowserService : MediaBrowserServiceCompat() {
         lastKaraokeText = null
     }
 
+    private fun composeSubtitle(original: String, translation: String?, next: String?): String {
+        val second = when (aaProfile) {
+            LayoutProfile.COMPACT -> null
+            LayoutProfile.NORMAL -> translation
+            LayoutProfile.WIDE -> translation ?: next?.takeIf { it.isNotBlank() }
+        }
+        return if (second != null) "$original\n$second" else original
+    }
+
     private fun getSubtitleText(state: LyricsState): String {
         val posMs = getAaPositionMs()
 
@@ -445,7 +511,8 @@ class LyricsBrowserService : MediaBrowserServiceCompat() {
                     line.text
                 }
                 val trans = state.translatedLines?.getOrNull(lineIdx)?.takeIf { it.isNotBlank() }
-                return if (trans != null) "$original\n$trans" else original
+                val next = state.lines.getOrNull(lineIdx + 1)?.text
+                return composeSubtitle(original, trans, next)
             }
         }
 
@@ -457,7 +524,8 @@ class LyricsBrowserService : MediaBrowserServiceCompat() {
             } else { 0 }
             val original = state.lines[idx].text
             val trans = state.translatedLines?.getOrNull(idx)?.takeIf { it.isNotBlank() }
-            return if (trans != null) "$original\n$trans" else original
+            val next = state.lines.getOrNull(idx + 1)?.text
+            return composeSubtitle(original, trans, next)
         }
 
         return when (state.status) {
@@ -593,7 +661,7 @@ class LyricsBrowserService : MediaBrowserServiceCompat() {
             findLineIndex(lines, posMs).coerceAtLeast(0)
         }
 
-        val winSize = if (isPlain) PLAIN_WINDOW_SIZE else WINDOW_SIZE
+        val winSize = if (isPlain) aaProfile.plainWindowSize else aaProfile.windowSize
         val half = winSize / 2
         val windowStart = maxOf(0, currentIdx - half)
         val windowEnd = minOf(lines.size, windowStart + winSize)
@@ -609,6 +677,7 @@ class LyricsBrowserService : MediaBrowserServiceCompat() {
         resetKaraokeState()
         notifyChildrenChanged(ROOT_ID)
         notifyChildrenChanged(SYNC_MENU_ID)
+        notifyChildrenChanged(SETTINGS_MENU_ID)
     }
 
     private fun throttledNotifyChildren(state: LyricsState) {
@@ -714,6 +783,13 @@ class LyricsBrowserService : MediaBrowserServiceCompat() {
                     .edit().putLong("aa_offset_ms", aaOffsetMs).apply()
                 notifyChildrenChanged(ROOT_ID)
                 notifyChildrenChanged(SYNC_MENU_ID)
+                return
+            }
+
+            if (mediaId.startsWith(PROFILE_PREFIX)) {
+                val profile = LayoutProfile.fromId(mediaId.removePrefix(PROFILE_PREFIX))
+                getSharedPreferences("auto_lyrics_prefs", MODE_PRIVATE)
+                    .edit().putString("aa_layout_profile", profile.id).apply()
                 return
             }
 
